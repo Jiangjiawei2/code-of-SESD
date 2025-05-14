@@ -40,4 +40,8 @@ The project's code is organized as follows:
 * `image_train.py`:  Main script for general model MRI training.
 * `sample_condition.py` : Main script(s) for general image generation/reconstruction/testing.
 
+ ##  Remark
+
+This version of the code has been anonymized for peer review by removing any information related to the submitting authors. However, the code makes use of open-source libraries including bkse, motionblur, and guided-diffusion. Any author names, paper references, or metadata within those external libraries are unrelated to this submission.
+
 ​                                                                                                                                                                      
