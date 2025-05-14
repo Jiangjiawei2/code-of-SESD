@@ -1,0 +1,46 @@
+# 4694-Partial Diffusion Suffices: Score Evolution-Guided General Inverse Problems Solving
+
+## Overview
+
+This project/repository contains our work. This version is primarily intended for peer review.
+
+## Core Algorithm
+
+The core contribution of our work, the main implementation of which is located in the following directory:
+
+* `util/algo/pdse/`
+
+## Code and Model Release Plan
+
+We are committed to promoting openness and reproducibility in our research field.
+
+The complete, runnable code for this project, including all necessary scripts, utilities, and the fine-tuned model checkpoints specifically for MRI (Magnetic Resonance Imaging) tasks, will be made publicly available on a code hosting platform (e.g., GitHub) upon the formal conclusion of the peer-review process for the associated academic publication.
+
+At that time, we will provide clear instructions and resources to ensure that the research community can smoothly access and run the code, and reproduce our experimental results.
+
+Thank you for your understanding and patience.
+
+## Code Structure
+
+The project's code is organized as follows:
+
+* `configs/`: Contains YAML configuration files for experiments.
+* `data/`: Contains dataloader implementations.
+* `guided_diffusion/`: Core diffusion model components (often based on or adapted from existing guided-diffusion repositories).
+* `models/`: (If applicable) May contain network architecture definitions.
+* `util/`: Contains various utility functions:
+  * `algo/`: Implementations of various algorithms.
+    * `pdse/`: The core algorithm implementation is located here.
+    * `dmplug.py`: DMPlug algorithm.
+    * `mpgd.py`: MPGD and DPS algorithms.
+    * `red_diff.py`: RED-diff and acce-RED-diff series of algorithms.
+    * `utils.py`: Helper functions related to algorithms (e.g., metrics calculation, logging, early stopping strategies).
+  * `img_utils.py`: Image processing-related utilities.
+  * `logger.py`: Logging setup.
+  * `tools.py`: (If present) Other general tools.
+* `outputs/`: Default directory for saving experimental results, logs, and images.
+* `image_train.py`: (If applicable) Main script for general model training.
+* `image_train_mri.py`: (If applicable) Main script for training MRI-related models.
+* `sample_condition.py` / `image_sample.py` / `inference.py`: (If applicable) Main script(s) for general image generation/reconstruction/testing.
+
+​                                                                                                                                                                      
