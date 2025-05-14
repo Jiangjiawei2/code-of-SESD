@@ -1,0 +1,25 @@
+conditioning:
+  method: dmplug
+  params:
+    scale: 0.3 # will be changed in another script
+  
+kernel: gaussian
+kernel_size: 64
+intensity: 3.0
+
+
+data:
+  name: ffhq
+  root: ./data/samples
+
+# data:
+#   name: celeba
+#   root: ./data/celeba/
+
+measurement:
+  operator:
+    name: turbulence
+  
+  noise: 
+    name: gaussian
+    noise_scale: 0.01

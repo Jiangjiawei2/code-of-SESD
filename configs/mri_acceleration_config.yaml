@@ -1,0 +1,18 @@
+conditioning:
+  method: mpgd
+  params:
+    scale: 0.3 # will be changed in another script
+
+data:
+  name: m4raw
+  root: /root/data1/jjw/dataset/m4raw/test/
+# data:
+#   name: celeba
+#   root: ./data/celeba/
+measurement:
+  operator:
+    name: mri_acce
+  
+  noise: 
+    name: gaussian
+    noise_scale: 0.01

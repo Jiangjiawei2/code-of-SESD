@@ -1,0 +1,27 @@
+conditioning:
+  method: mpgd_wo_proj # Do not touch
+  params:
+    scale: 10
+
+# data:
+#   name: ffhq
+#   root: ./data/samples
+# data:
+#   name: celeba
+#   root: ./data/celeba/
+
+data:
+  name: celeba
+  root: ./data/old_image/
+
+measurement:
+  operator:
+    name: inpainting
+  mask_opt:
+    mask_type: random
+    mask_prob_range: !!python/tuple [0.7, 0.71]
+    image_size: 256
+
+  noise:
+    name: gaussian
+    noise_scale: 0.01

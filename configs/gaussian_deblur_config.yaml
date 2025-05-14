@@ -1,0 +1,26 @@
+conditioning:
+  method: mpgd_wo_proj
+  params:
+    scale: 10 # will be changed in another script
+
+# data:
+#   name: ffhq
+#   root: ./data/samples
+
+# data:
+#   name: celeba
+#   root: ./data/celeba/
+
+data:
+  name: celeba
+  root: ./data/old_image/
+
+measurement:
+  operator:
+    name: gaussian_blur
+    kernel_size: 61
+    intensity: 3.0
+  
+  noise: 
+    name: gaussian
+    noise_scale: 0.01

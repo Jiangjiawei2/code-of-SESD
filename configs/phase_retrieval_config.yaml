@@ -1,0 +1,19 @@
+conditioning:
+  method: ps
+  params:
+    scale: 1.0
+
+data:
+  name: ffhq
+  root: ./data/samples
+# data:
+#   name: celeba
+#   root: ./data/celeba/
+measurement:
+  operator:
+    name: phase_retrieval
+    oversample: 2.0
+
+  noise: 
+    name: gaussian
+    noise_scale: 0.01
