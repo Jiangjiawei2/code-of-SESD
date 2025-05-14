@@ -25,22 +25,19 @@ Thank you for your understanding and patience.
 The project's code is organized as follows:
 
 * `configs/`: Contains YAML configuration files for experiments.
-* `data/`: Contains dataloader implementations.
 * `guided_diffusion/`: Core diffusion model components (often based on or adapted from existing guided-diffusion repositories).
-* `models/`: (If applicable) May contain network architecture definitions.
 * `util/`: Contains various utility functions:
   * `algo/`: Implementations of various algorithms.
     * `pdse/`: The core algorithm implementation is located here.
     * `dmplug.py`: DMPlug algorithm.
-    * `mpgd.py`: MPGD and DPS algorithms.
-    * `red_diff.py`: RED-diff and acce-RED-diff series of algorithms.
+    * `mpgd.py`: MPGD  algorithms.
+    * `dps.py`: DPS algorithms.
     * `utils.py`: Helper functions related to algorithms (e.g., metrics calculation, logging, early stopping strategies).
   * `img_utils.py`: Image processing-related utilities.
   * `logger.py`: Logging setup.
-  * `tools.py`: (If present) Other general tools.
+  * `tools.py`:Other general tools.
 * `outputs/`: Default directory for saving experimental results, logs, and images.
-* `image_train.py`: (If applicable) Main script for general model training.
-* `image_train_mri.py`: (If applicable) Main script for training MRI-related models.
-* `sample_condition.py` / `image_sample.py` / `inference.py`: (If applicable) Main script(s) for general image generation/reconstruction/testing.
+* `image_train.py`:  Main script for general model MRI training.
+* `sample_condition.py` : Main script(s) for general image generation/reconstruction/testing.
 
 ​                                                                                                                                                                      
