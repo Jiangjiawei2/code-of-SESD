@@ -1,4 +1,4 @@
-# 4694-Partial Diffusion Suffices: Score Evolution-Guided General Inverse Problems Solving
+# Score Evolution Guided Shortcut Diffusion for General Inverse Problems
 
 ## Overview
 
@@ -8,7 +8,7 @@ This project/repository contains our work. This version is primarily intended fo
 
 The core contribution of our work, the main implementation of which is located in the following directory:
 
-* `util/algo/pdse/`
+* `util/algo/sesd/`
 
 ## Code and Model Release Plan
 
@@ -28,7 +28,7 @@ The project's code is organized as follows:
 * `guided_diffusion/`: Core diffusion model components (often based on or adapted from existing guided-diffusion repositories).
 * `util/`: Contains various utility functions:
   * `algo/`: Implementations of various algorithms.
-    * `pdse/`: The core algorithm implementation is located here.
+    * `sesd/`: The core algorithm implementation is located here.
     * `dmplug.py`: DMPlug algorithm.
     * `mpgd.py`: MPGD  algorithms.
     * `dps.py`: DPS algorithms.
@@ -40,8 +40,5 @@ The project's code is organized as follows:
 * `image_train.py`:  Main script for general model MRI training.
 * `sample_condition.py` : Main script(s) for general image generation/reconstruction/testing.
 
- ##  Remark
-
-This version of the code has been anonymized for peer review by removing any information related to the submitting authors. However, the code makes use of open-source libraries including bkse, motionblur, and guided-diffusion. Any author names, paper references, or metadata within those external libraries are unrelated to this submission.
 
 ​                                                                                                                                                                      
