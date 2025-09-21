@@ -28,7 +28,7 @@ The project's code is organized as follows:
 * `guided_diffusion/`: Core diffusion model components (often based on or adapted from existing guided-diffusion repositories).
 * `util/`: Contains various utility functions:
   * `algo/`: Implementations of various algorithms.
-    * `sesd/`: The core algorithm implementation is located here.
+    * `pdse/`: The core algorithm implementation is located here.
     * `dmplug.py`: DMPlug algorithm.
     * `mpgd.py`: MPGD  algorithms.
     * `dps.py`: DPS algorithms.
