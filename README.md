@@ -1,4 +1,4 @@
-# Score Evolution Guided Shortcut Diffusion for General Inverse Problems
+# Score Evolved Shortcut Diffusion for General Inverse Problems
 
 ## Overview
 
