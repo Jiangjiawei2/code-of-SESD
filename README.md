@@ -1,4 +1,4 @@
-# Score Evolved Shortcut Diffusion for General Inverse Problems
+# Partial Diffusion Suffices: Solving General Inverse Problems via Score Evolution
 
 ## Overview
 
