@@ -8,7 +8,7 @@ This project/repository contains our work. This version is primarily intended fo
 
 The core contribution of our work, the main implementation of which is located in the following directory:
 
-* `util/algo/sesd/`
+* `util/algo/pdse/`
 
 ## Code and Model Release Plan
 
