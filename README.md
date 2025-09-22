@@ -14,9 +14,7 @@ The core contribution of our work, the main implementation of which is located i
 
 We are committed to promoting openness and reproducibility in our research field.
 
-The complete, runnable code for this project, including all necessary scripts, utilities, and the fine-tuned model checkpoints specifically for MRI (Magnetic Resonance Imaging) tasks, will be made publicly available on a code hosting platform (e.g., GitHub) upon the formal conclusion of the peer-review process for the associated academic publication.
-
-At that time, we will provide clear instructions and resources to ensure that the research community can smoothly access and run the code, and reproduce our experimental results.
+The complete, runnable code for this project, including all necessary scripts, utilities, and the fine-tuned model checkpoints specifically for MRI and CT tasks, will be made publicly available on GitHub.
 
 Thank you for your understanding and patience.
 
