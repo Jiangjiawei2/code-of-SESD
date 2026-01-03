@@ -3,8 +3,10 @@
 # DMPlug
 from .dumplug import DMPlug, DMPlug_turbulence
 
-# RED
-from .Trundiff import acce_RED_diff, acce_RED_diff_turbulence,acce_RED_diff_ablation, acce_RED_diff_mri
+# SESD (Renamed from acce_RED_diff / Trundiff)
+from .sesd import SESD, SESD_MRI, SESD_Core
+# Legacy aliases for compatibility if needed (but now we use SESD)
+from .sesd import acce_RED_diff, acce_RED_diff_mri, acce_RED_diff_ablation, acce_RED_diff_turbulence
 
 # MPGD 
 from .mpgd import mpgd, mpgd_mri

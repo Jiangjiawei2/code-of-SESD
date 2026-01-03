@@ -43,7 +43,7 @@ def main():
     parser.add_argument('--scale', type=float, default=17.5, help="Conditioning scale factor.")
     parser.add_argument('--method', type=str, default='mpgd_wo_proj', help="Conditioning method name (e.g., mpgd_wo_proj).") 
     parser.add_argument('--save_dir', type=str, default='./outputs/ffhq/', help="Base directory to save output images and logs.")
-    parser.add_argument('--algo', type=str, default='acce_RED_diff', help="Algorithm to use for reconstruction.")
+    parser.add_argument('--algo', type=str, default='SESD', help="Algorithm to use for reconstruction.")
     parser.add_argument('--iter', type=int, default=200, help="Number of iterations for the chosen algorithm.")
     parser.add_argument('--lr', type=float, default=0.005, help="Learning rate for algorithms that use it.")
     parser.add_argument('--noise_scale', type=float, default=0.03, help='Scale of the noise to be added to measurements.')
@@ -366,13 +366,30 @@ def main():
                     current_sample_fn, ref_img, y_n, out_path, fname, device, 
                     mask=active_mask, random_seed=random_seed, writer=writer, img_index=i, loss_fn_alex=loss_fn_alex # Pass LPIPS
                 )
-            elif args.algo == 'acce_RED_diff':
-                sample, metrics, psnr_curve_data = acce_RED_diff(
-                    model, sampler, current_measurement_cond_fn, ref_img, y_n, device, model_config, measure_config, operator, fname,
-                    iter_step=int(args.iter_step), iteration=args.iter, denoiser_step=args.timestep, stop_patience=15, 
-                    early_stopping_threshold=0.02, lr=args.lr, out_path=out_path, mask=active_mask, random_seed=random_seed,
-                    writer=writer, img_index=i, loss_fn_alex=loss_fn_alex # Pass LPIPS
-                )
+            elif args.algo == 'SESD' or args.algo == 'acce_RED_diff':
+                try:
+                    sample, metrics, psnr_curve_data = SESD(
+                        model, sampler, current_measurement_cond_fn, ref_img, y_n, device, model_config, measure_config, operator, fname,
+                        iter_step=int(args.iter_step), iteration=args.iter, denoiser_step=args.timestep, stop_patience=15, 
+                        early_stopping_threshold=0.02, lr=args.lr, out_path=out_path, mask=(active_mask if measure_config['operator']['name'] == 'inpainting' else None), random_seed=random_seed,
+                        writer=writer, img_index=i, loss_fn_alex=loss_fn_alex # Pass LPIPS
+                    )
+                except Exception as e:
+                    logger.error(f"Error during SESD execution for image {i}: {e}")
+                    logger.error(traceback.format_exc())
+                    continue
+            elif args.algo == 'SESD_MRI' or args.algo == 'acce_RED_diff_mri':
+                try:
+                    sample, metrics, psnr_curve_data = SESD_MRI(
+                        model, sampler, current_measurement_cond_fn, ref_img, y_n, k_under, mask,csm,min_val, max_val , device, model_config, measure_config, operator, fname,
+                        iter_step=int(args.iter_step), iteration=args.iter, denoiser_step=args.timestep, stop_patience=15, 
+                        early_stopping_threshold=0.02, lr=args.lr, out_path=out_path, random_seed=random_seed,
+                        writer=writer, img_index=i, loss_fn_alex=loss_fn_alex # Pass LPIPS
+                    )
+                except Exception as e:
+                    logger.error(f"Error during SESD_MRI execution for image {i}: {e}")
+                    logger.error(traceback.format_exc())
+                    continue
             elif args.algo == 'acce_RED_diff_ablation':
                  sample, metrics, psnr_curve_data = acce_RED_diff_ablation(
                     model, sampler, current_measurement_cond_fn, ref_img, y_n, device, model_config, measure_config, operator, fname,

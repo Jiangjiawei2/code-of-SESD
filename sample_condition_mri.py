@@ -45,7 +45,7 @@ def main():
     parser.add_argument('--scale', type=float, default=17.5)
     parser.add_argument('--method', type=str, default='mpgd_wo_proj') # mpgd_wo_proj
     parser.add_argument('--save_dir', type=str, default='./outputs/ffhq/')
-    parser.add_argument('--algo', type=str, default='acce_RED_diff_mri')  ##  dps_mri , acce_RED_diff_mri
+    parser.add_argument('--algo', type=str, default='SESD_MRI')  ##  dps_mri , SESD_MRI
     parser.add_argument('--iter', type=int, default=500)
     parser.add_argument('--lr', type=float, default=0.005)
     parser.add_argument('--noise_scale', type=float, default=0.0, help='a value of noise_scale')
@@ -436,9 +436,9 @@ def main():
                     logger.error(traceback.format_exc())  # Print full stack trace
                     continue
                 
-            elif args.algo == 'acce_RED_diff_mri':
+            elif args.algo == 'SESD_MRI' or args.algo == 'acce_RED_diff_mri':
                 try:
-                    sample, metrics, psnr_curve = acce_RED_diff_mri(
+                    sample, metrics, psnr_curve = SESD_MRI(
                         model, sampler, current_measurement_cond_fn, ref_img, y_n, k_under, mask,csm,min_val, max_val , device, model_config, measure_config, operator, fname,
                         iter_step=int(args.iter_step), iteration=args.iter, denoiser_step=args.timestep, stop_patience=15, 
                         early_stopping_threshold=0.02, lr=args.lr, out_path=out_path, random_seed=random_seed,
