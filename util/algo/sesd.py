@@ -1,513 +1,457 @@
 # util/algo/sesd.py
+"""
+SESD: Score Evolved Shortcut Diffusion with ALES
+For standard inverse problems: super-resolution, deblurring, inpainting
+"""
 import torch
 import torch.nn as nn
 import numpy as np
 import os
-import traceback
+import matplotlib.pyplot as plt
 from tqdm import tqdm
 import lpips
-import fastmri
-from util.algo.utils import compute_metrics as compute_metrics_util, log_metrics_to_tensorboard, ESWithWMV
-
-# ═══════════════════════════════════════════════════════════════════════
-# Measurement Operator Abstraction Layer
-# ═══════════════════════════════════════════════════════════════════════
-
-class MeasurementOperator:
-    """Base class for measurement operators in SESD."""
-    def forward(self, x, mask=None):
-        raise NotImplementedError
-    
-    def project(self, x, y, mask=None, alpha=None):
-        """
-        Projects x onto the measurement manifold defined by y.
-        Returns the data consistency update v_k.
-        """
-        raise NotImplementedError
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+from util.algo.utils import ESWithWMV, log_metrics_to_tensorboard
 
 
-class StandardOperator(MeasurementOperator):
-    """
-    Standard operator for deblurring, super-resolution, inpainting tasks.
-    """
-    def __init__(self, operator_module, device, mu=1.0):
-        self.operator = operator_module
-        self.device = device
-        self.mu = torch.tensor(mu, device=device)
-
-    def forward(self, x, mask=None):
-        return self.operator.forward(x, mask=mask) if mask is not None else self.operator.forward(x)
-
-    def project(self, x, y, mask=None, alpha=None):
-        """Gradient descent based projection for general linear/nonlinear problems."""
-        with torch.enable_grad():
-            x_in = x.detach().clone().requires_grad_(True)
-            Ax = self.forward(x_in, mask)
-            
-            # Use MSE-like gradient for stability
-            loss = torch.linalg.norm(y - Ax)
-            grad = torch.autograd.grad(loss, x_in)[0]
-            
-            v_k = x - self.mu * grad
-        return v_k
-
-
-class MRIOperator(MeasurementOperator):
-    """
-    MRI specific operator handling multi-coil k-space data.
-    """
-    def __init__(self, device, k_under, mask_dc, csm, img_min, img_max):
-        self.device = device
-        self.k_under = k_under
-        self.mask_dc = mask_dc
-        self.csm = csm
-        self.img_min = img_min
-        self.img_max = img_max
-        
-        # Internal modules
-        self.dc_layer = DC_layer_CSM().to(device)
-        self.mri_fwd = mri_forward().to(device)
-
-    def forward(self, x, mask=None):
-        return self.mri_fwd(x, self.mask_dc, self.csm, self.img_min, self.img_max)
-
-    def project(self, x, y, mask=None, alpha=None):
-        """Data consistency layer projection."""
-        # x is [B, C, H, W]. MRI code uses x[:, 0:1, ...]
-        x_single = x[:, 0:1, :, :]
-        v_k_single = self.dc_layer(x_single, self.k_under, self.mask_dc, self.csm, self.img_min, self.img_max)
-        
-        # Broadcast back to C channels if necessary (e.g. for model input)
-        v_k = v_k_single.repeat(1, x.shape[1], 1, 1).contiguous()
-        return v_k
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Core Algorithm: SESD with ALES
-# ═══════════════════════════════════════════════════════════════════════
-
-def SESD_Core(
-    model, sampler, measurement_cond_fn, ref_img, y_n,
-    model_config, operator: MeasurementOperator, fname,
-    iter_step, iteration, denoiser_step, lr, out_path,
-    loss_fn_alex, device, mask_sampling=None, random_seed=None,
+def sesd(
+    model, sampler, measurement_cond_fn, ref_img, y_n, device, 
+    model_config, measure_config, operator, fname,
+    iter_step=3, iteration=300, denoiser_step=10, lr=0.02,
+    out_path='./outputs/', mask=None, random_seed=None,
     writer=None, img_index=None,
-    # ALES parameters
+    # ALES parameters (Algorithm 2 in paper)
     use_ales=True,
-    ales_window_size=10,
-    ales_var_threshold=1e-3,
-    ales_alpha=1e-3,
-    ales_patience=20,
-    ales_min_epochs=30
+    window_size=10,        # W: window size for time-weighted variance
+    var_threshold=1e-3,    # δ_v: variance threshold
+    loss_threshold=1e-3,   # α: loss threshold  
+    patience=20,           # P: patience for early stopping
+    min_epochs=30,         # E_min: minimum iterations before stopping
+    **kwargs
 ):
     """
-    SESD: Score Evolved Shortcut Diffusion with ALES (Adaptive Local Early Stopping).
+    SESD: Score Evolved Shortcut Diffusion with ALES
     
-    ALES Parameters:
-        use_ales: Whether to enable ALES early stopping
-        ales_window_size: Window size W for time-weighted variance
-        ales_var_threshold: Variance threshold δ_v
-        ales_alpha: Loss threshold α
-        ales_patience: Patience parameter P
-        ales_min_epochs: Minimum iterations E_min before early stopping
+    This is the standard version for image inverse problems.
+    
+    Args:
+        model: Pretrained diffusion model
+        sampler: Diffusion sampler (e.g., DDPM, DDIM)
+        measurement_cond_fn: Measurement conditioning function
+        ref_img: Reference/ground truth image
+        y_n: Degraded measurement
+        device: Computation device
+        model_config: Model configuration dict
+        measure_config: Measurement configuration dict
+        operator: Forward operator A (e.g., blur, downsample, mask)
+        fname: Filename for saving results
+        iter_step: Shortcut timestep t* (default: 3)
+        iteration: Max optimization iterations (default: 300)
+        denoiser_step: Total diffusion steps T (default: 10)
+        lr: Learning rate (default: 0.02)
+        out_path: Output directory
+        mask: Optional mask for inpainting
+        random_seed: Random seed for reproducibility
+        writer: TensorBoard writer
+        img_index: Image index for logging
+        use_ales: Enable ALES early stopping
+        window_size: ALES parameter W
+        var_threshold: ALES parameter δ_v
+        loss_threshold: ALES parameter α
+        patience: ALES parameter P
+        min_epochs: ALES parameter E_min
+    
+    Returns:
+        best_sample: Best reconstructed image
+        best_metrics: Dict with PSNR, SSIM, LPIPS
+        psnr_curve: Dict with PSNR history
     """
+    
+    # ══════════════════════════════════════════════════════════════════
+    # Setup: Random seed and logging
+    # ══════════════════════════════════════════════════════════════════
     if random_seed is not None:
         torch.manual_seed(random_seed)
-        if torch.cuda.is_available(): 
-            torch.cuda.manual_seed_all(random_seed)
+        torch.cuda.manual_seed_all(random_seed)
         np.random.seed(random_seed)
-
-    # ─────────────────────────────────────────────────────────────────
-    # Logging configuration to TensorBoard
-    # ─────────────────────────────────────────────────────────────────
-    algo_name = "SESD"
-    if writer and img_index is not None:
-        config_text = (
-            f'Algorithm: {algo_name}\n'
+    
+    # Log configuration to TensorBoard
+    if writer is not None and img_index is not None:
+        config_str = (
+            f'Algorithm: SESD\n'
             f'Iterations: {iteration}\n'
-            f'LR: {lr}\n'
+            f'Learning Rate: {lr}\n'
             f'Shortcut Step t*: {iter_step}\n'
             f'Total Steps T: {denoiser_step}\n'
             f'ALES Enabled: {use_ales}\n'
         )
         if use_ales:
-            config_text += (
-                f'ALES Window Size W: {ales_window_size}\n'
-                f'ALES Var Threshold δ_v: {ales_var_threshold}\n'
-                f'ALES Alpha α: {ales_alpha}\n'
-                f'ALES Patience P: {ales_patience}\n'
-                f'ALES Min Epochs E_min: {ales_min_epochs}\n'
+            config_str += (
+                f'ALES W: {window_size}\n'
+                f'ALES δ_v: {var_threshold}\n'
+                f'ALES α: {loss_threshold}\n'
+                f'ALES P: {patience}\n'
+                f'ALES E_min: {min_epochs}\n'
             )
-        writer.add_text(f'{algo_name}/Image_{img_index}/Config', config_text, 0)
-
-    # ─────────────────────────────────────────────────────────────────
-    # 1. Initialize Z at t* (Shortcut)
-    # ─────────────────────────────────────────────────────────────────
-    Z_channels = 3  # Standard RGB
-    Z = torch.randn((1, Z_channels, model_config['image_size'], model_config['image_size']), device=device)
+        writer.add_text(f'sesd/Image_{img_index}/Config', config_str, 0)
+        
+        # Log reference and measurement images
+        if ref_img.dim() == 4:
+            ref_to_log = (ref_img[0] + 1) / 2
+        else:
+            ref_to_log = (ref_img + 1) / 2
+        writer.add_image(f'sesd/Image_{img_index}/Reference', ref_to_log, 0)
+        
+        if y_n.dim() == 4:
+            y_to_log = (y_n[0] + 1) / 2
+        else:
+            y_to_log = (y_n + 1) / 2
+        writer.add_image(f'sesd/Image_{img_index}/Measurement', y_to_log, 0)
     
-    current_state = Z
+    # ══════════════════════════════════════════════════════════════════
+    # Step 1: Initialize random noise Z and shortcut to t*
+    # ══════════════════════════════════════════════════════════════════
+    Z = torch.randn(
+        (1, 3, model_config['image_size'], model_config['image_size']), 
+        device=device
+    )
+    
+    if writer is not None and img_index is not None:
+        writer.add_image(f'sesd/Image_{img_index}/Initial_Noise', (Z[0] + 1) / 2, 0)
+    
+    # Shortcut: Forward diffusion from T down to t* (skip first denoiser_step - iter_step steps)
+    sample = Z
     with torch.no_grad():
-        # Shortcut: sampling from T down to t* (iter_step)
-        for i in range(denoiser_step - 1, iter_step - 1, -1):
-            t_val = torch.tensor([i] * Z.shape[0], device=device)
-            current_state, _ = sampler.p_sample(
-                model=model, x=current_state, t=t_val,
-                measurement=y_n, measurement_cond_fn=measurement_cond_fn, mask=mask_sampling
+        for i, t in enumerate(tqdm(
+            list(range(denoiser_step))[::-1], 
+            desc="Shortcut to t*"
+        )):
+            time = torch.tensor(
+                [t] * (1 if ref_img.dim() == 3 else ref_img.shape[0]), 
+                device=device
+            )
+            # Stop at t* (keep last iter_step for optimization)
+            if i >= denoiser_step - iter_step:
+                print(f"Shortcut stopped at step {i+1} (t*={iter_step})")
+                break
+            
+            if i == 0:
+                sample, pred_start = sampler.p_sample(
+                    model=model, x=Z, t=time, 
+                    measurement=y_n, measurement_cond_fn=measurement_cond_fn, 
+                    mask=mask
+                )
+            else:
+                sample, pred_start = sampler.p_sample(
+                    model=model, x=sample, t=time,
+                    measurement=y_n, measurement_cond_fn=measurement_cond_fn,
+                    mask=mask
+                )
+        
+        if writer is not None and img_index is not None:
+            writer.add_image(
+                f'sesd/Image_{img_index}/After_Shortcut', 
+                (sample[0] + 1) / 2, 0
             )
     
-    initial_shortcut_state = current_state.detach().clone()
+    # ══════════════════════════════════════════════════════════════════
+    # Step 2: Optimization setup
+    # ══════════════════════════════════════════════════════════════════
+    sample = sample.detach().clone().requires_grad_(True)
     
-    # ─────────────────────────────────────────────────────────────────
-    # 2. Optimization Setup
-    # ─────────────────────────────────────────────────────────────────
-    x_opt = initial_shortcut_state.requires_grad_(True)
-    
-    # Learnable balancing parameter λ (renamed from α in rebuttal for clarity)
-    lambda_param = torch.tensor(0.5, requires_grad=True, device=device) 
+    # Learnable balancing parameter λ (renamed from α in rebuttal)
+    lambda_param = torch.tensor(0.5, requires_grad=True, device=device)
     
     optimizer = torch.optim.Adam([
-        {'params': x_opt, 'lr': lr},
+        {'params': sample, 'lr': lr},
         {'params': lambda_param, 'lr': lr * 0.1}  # Smaller LR for λ
     ])
     
-    data_fidelity_loss_fn = nn.L1Loss().to(device)
+    # Loss functions
+    loss_fn_alex = lpips.LPIPS(net='alex').to(device)
+    l1_loss = nn.L1Loss().to(device)
     
-    # ─────────────────────────────────────────────────────────────────
-    # 3. ALES Early Stopper Initialization
-    # ─────────────────────────────────────────────────────────────────
+    # Metrics storage
+    losses = []
+    psnrs = []
+    ssims = []
+    lpipss = []
+    
+    # ══════════════════════════════════════════════════════════════════
+    # Step 3: ALES early stopper initialization
+    # ══════════════════════════════════════════════════════════════════
     if use_ales:
         early_stopper = ESWithWMV(
-            window_size=ales_window_size,
-            var_threshold=ales_var_threshold,
-            alpha=ales_alpha,
-            patience=ales_patience,
-            min_epochs=ales_min_epochs,
+            window_size=window_size,
+            var_threshold=var_threshold,
+            alpha=loss_threshold,
+            patience=patience,
+            min_epochs=min_epochs,
             verbose=True
         )
     
-    best_psnr = -float('inf')
+    best_loss = float('inf')
     best_sample = None
     best_metrics = None
     best_epoch = 0
     
-    psnrs_log = []
-    
-    # ─────────────────────────────────────────────────────────────────
-    # 4. Optimization Loop (with ALES)
-    # ─────────────────────────────────────────────────────────────────
-    pbar = tqdm(range(iteration), desc=f"SESD Opt. Img {img_index or ''}")
+    # ══════════════════════════════════════════════════════════════════
+    # Step 4: Optimization loop with ALES
+    # ══════════════════════════════════════════════════════════════════
+    pbar = tqdm(range(iteration), desc="SESD Optimization")
     for epoch in pbar:
         model.eval()
         optimizer.zero_grad()
         
-        # ═══ A. Denoise from current x_{t*} to x_0 (approx) ═══
-        denoised_state = x_opt
-        for i in range(iter_step - 1, -1, -1):
-             t_val = torch.tensor([i] * denoised_state.shape[0], device=device)
-             denoised_state, _ = sampler.p_sample(
-                 model=model, x=denoised_state, t=t_val,
-                 measurement=y_n, measurement_cond_fn=measurement_cond_fn, mask=mask_sampling
-             )
+        # ─────────────────────────────────────────────────────────────
+        # A. Reverse diffusion from t* to 0 (denoising)
+        # ─────────────────────────────────────────────────────────────
+        x_t = sample
+        x_t.requires_grad_(True)
         
-        # ═══ B. Data Consistency via Operator Projection ═══
-        v_k = operator.project(denoised_state, y_n, mask=mask_sampling)
-        
-        # ═══ C. Fusion (using λ instead of α) ═══
-        current_lambda = torch.sigmoid(lambda_param)
-        x_k_fusion = current_lambda * denoised_state + (1 - current_lambda) * v_k
-        
-        # ═══ D. Loss Calculation ═══
-        est_measurement = operator.forward(x_k_fusion, mask=mask_sampling)
-        loss = data_fidelity_loss_fn(est_measurement, y_n)
-        
-        # ═══ E. Backpropagation ═══
-        loss.backward()
-        optimizer.step()
-        
-        # ═══ F. Metrics Logging & ALES Check ═══
-        with torch.no_grad():
-            sample_eval = x_k_fusion
-            if ref_img.shape[1] == 1 and x_k_fusion.shape[1] == 3:
-                sample_eval = x_k_fusion[:, 0:1, :, :]
-                
-            curr_metrics = compute_metrics_util(
-                sample=sample_eval, ref_img=ref_img, device=device, loss_fn_alex=loss_fn_alex
+        for i, t in enumerate(list(range(iter_step))[::-1]):
+            time = torch.tensor(
+                [t] * (1 if ref_img.dim() == 3 else ref_img.shape[0]),
+                device=device
             )
-            curr_psnr = curr_metrics.get('psnr', float('nan'))
-            psnrs_log.append(curr_psnr)
+            x_t, pred_start = sampler.p_sample(
+                model=model, x=x_t, t=time,
+                measurement=y_n, measurement_cond_fn=measurement_cond_fn,
+                mask=mask
+            )
+        
+        # ─────────────────────────────────────────────────────────────
+        # B. Data consistency acceleration via gradient
+        # ─────────────────────────────────────────────────────────────
+        try:
+            if mask is not None:
+                difference = y_n - operator.forward(x_t, mask=mask)
+            else:
+                difference = y_n - operator.forward(x_t)
             
-            pbar.set_postfix({
-                'loss': loss.item(), 
-                'λ': current_lambda.item(), 
-                'psnr': curr_psnr
-            })
+            norm = torch.linalg.norm(difference)
+            norm_grad = torch.autograd.grad(
+                outputs=norm, inputs=x_t, retain_graph=True
+            )[0]
             
-            # Update best sample
-            if not np.isnan(curr_psnr) and curr_psnr > best_psnr:
-                best_psnr = curr_psnr
-                best_sample = x_k_fusion.detach().clone()
-                best_metrics = curr_metrics.copy()
-                best_epoch = epoch
+            # Data consistency update v_k
+            v_k = x_t - norm_grad
+            
+            # ─────────────────────────────────────────────────────────
+            # C. Fusion with learnable λ
+            # ─────────────────────────────────────────────────────────
+            current_lambda = torch.sigmoid(lambda_param)
+            x_k = current_lambda * x_t + (1 - current_lambda) * v_k
+            
+            # ─────────────────────────────────────────────────────────
+            # D. Loss computation
+            # ─────────────────────────────────────────────────────────
+            if mask is not None:
+                loss = l1_loss(operator.forward(x_k, mask=mask), y_n)
+            else:
+                loss = l1_loss(operator.forward(x_k), y_n)
+            
+            losses.append(loss.item())
+            
+            # ─────────────────────────────────────────────────────────
+            # E. Backpropagation
+            # ─────────────────────────────────────────────────────────
+            loss.backward(retain_graph=True)
+            optimizer.step()
+            
+            # ─────────────────────────────────────────────────────────
+            # F. Metrics computation
+            # ─────────────────────────────────────────────────────────
+            with torch.no_grad():
+                # Ensure dimension consistency
+                if ref_img.dim() == 4 and x_k.dim() == 3:
+                    x_k_compare = x_k.unsqueeze(0)
+                else:
+                    x_k_compare = x_k
                 
-            # TensorBoard logging
-            if writer and img_index is not None:
-                log_metrics_to_tensorboard(writer, {
-                    'Loss': loss.item(), 
-                    'PSNR': curr_psnr, 
-                    'SSIM': curr_metrics.get('ssim'),
-                    'Lambda': current_lambda.item()
-                }, epoch, img_index, prefix=f'{algo_name}/Epoch')
-            
-            # ═══ ALES Early Stopping Check ═══
-            if use_ales:
-                should_stop = early_stopper(epoch, x_k_fusion, loss.item())
-                if should_stop:
-                    print(f"\n🛑 ALES triggered early stopping at epoch {epoch+1}")
-                    if writer and img_index is not None:
-                        writer.add_text(
-                            f'{algo_name}/Image_{img_index}/ALES_Stop',
-                            f'ALES stopped at epoch {epoch+1}', epoch
+                # Convert to numpy for metrics
+                x_k_np = x_k_compare.detach().cpu().squeeze().numpy()
+                ref_np = ref_img.detach().cpu().squeeze().numpy()
+                
+                # Ensure [H, W, C] format
+                if x_k_np.shape[0] == 3 and len(x_k_np.shape) == 3:
+                    x_k_np = np.transpose(x_k_np, (1, 2, 0))
+                if ref_np.shape[0] == 3 and len(ref_np.shape) == 3:
+                    ref_np = np.transpose(ref_np, (1, 2, 0))
+                
+                # Normalize to [0, 1]
+                x_k_np = (x_k_np + 1) / 2
+                ref_np = (ref_np + 1) / 2
+                
+                # PSNR
+                try:
+                    current_psnr = peak_signal_noise_ratio(ref_np, x_k_np, data_range=1.0)
+                    psnrs.append(current_psnr)
+                except Exception as e:
+                    print(f"PSNR error: {e}")
+                    current_psnr = 0
+                    psnrs.append(current_psnr)
+                
+                # SSIM
+                try:
+                    current_ssim = structural_similarity(
+                        ref_np, x_k_np, channel_axis=2, data_range=1.0
+                    )
+                    ssims.append(current_ssim)
+                except Exception as e:
+                    print(f"SSIM error: {e}")
+                    current_ssim = 0
+                    ssims.append(current_ssim)
+                
+                # LPIPS
+                try:
+                    x_k_lpips = torch.from_numpy(x_k_np).permute(2, 0, 1).unsqueeze(0).float().to(device)
+                    ref_lpips = torch.from_numpy(ref_np).permute(2, 0, 1).unsqueeze(0).float().to(device)
+                    # LPIPS expects [-1, 1]
+                    x_k_lpips = x_k_lpips * 2 - 1
+                    ref_lpips = ref_lpips * 2 - 1
+                    current_lpips = loss_fn_alex(x_k_lpips, ref_lpips).item()
+                    lpipss.append(current_lpips)
+                except Exception as e:
+                    print(f"LPIPS error: {e}")
+                    current_lpips = 0
+                    lpipss.append(current_lpips)
+                
+                # ─────────────────────────────────────────────────────
+                # G. TensorBoard logging
+                # ─────────────────────────────────────────────────────
+                if writer is not None and img_index is not None:
+                    metrics_base = f'sesd_metrics/image_{img_index}'
+                    
+                    writer.add_scalar(f'{metrics_base}/Loss', loss.item(), epoch)
+                    writer.add_scalar(f'{metrics_base}/PSNR', current_psnr, epoch)
+                    writer.add_scalar(f'{metrics_base}/SSIM', current_ssim, epoch)
+                    writer.add_scalar(f'{metrics_base}/LPIPS', current_lpips, epoch)
+                    writer.add_scalar(f'{metrics_base}/Lambda', current_lambda.item(), epoch)
+                    
+                    if epoch % 10 == 0:
+                        img = x_k.detach().cpu()
+                        if img.dim() == 4:
+                            img = img[0]
+                        img_normalized = (img + 1) / 2
+                        img_normalized = torch.clamp(img_normalized, 0, 1)
+                        writer.add_image(
+                            f'sesd/Image_{img_index}/Progress/Epoch_{epoch}',
+                            img_normalized, epoch
                         )
-                    break
-
-    if best_sample is None: 
-        best_sample = x_k_fusion.detach()
+                
+                # ─────────────────────────────────────────────────────
+                # H. Track best sample
+                # ─────────────────────────────────────────────────────
+                if loss.item() < best_loss:
+                    best_loss = loss.item()
+                    best_sample = x_k.clone().detach()
+                    best_metrics = {
+                        'psnr': current_psnr,
+                        'ssim': current_ssim,
+                        'lpips': current_lpips
+                    }
+                    best_epoch = epoch
+                    
+                    if writer is not None and img_index is not None:
+                        writer.add_text(
+                            f'sesd/Image_{img_index}/Best/Info',
+                            f'Epoch: {best_epoch}\n'
+                            f'Loss: {best_loss:.6f}\n'
+                            f'PSNR: {current_psnr:.4f}\n'
+                            f'SSIM: {current_ssim:.4f}\n'
+                            f'LPIPS: {current_lpips:.4f}',
+                            best_epoch
+                        )
+                
+                # ─────────────────────────────────────────────────────
+                # I. ALES early stopping check
+                # ─────────────────────────────────────────────────────
+                if use_ales:
+                    should_stop = early_stopper(epoch, x_k, loss.item())
+                    if should_stop:
+                        print(f"\n🛑 ALES early stopping triggered at epoch {epoch+1}")
+                        if writer is not None and img_index is not None:
+                            writer.add_text(
+                                f'sesd/Image_{img_index}/ALES_Stop',
+                                f'Early stopped at epoch {epoch+1}',
+                                epoch
+                            )
+                        break
+                
+                # Update progress bar
+                pbar.set_postfix({
+                    'Loss': f"{loss.item():.4f}",
+                    'λ': f"{current_lambda.item():.4f}",
+                    'PSNR': f"{current_psnr:.4f}",
+                    'SSIM': f"{current_ssim:.4f}"
+                })
+        
+        except Exception as e:
+            print(f"Error in optimization: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
     
-    # ─────────────────────────────────────────────────────────────────
-    # 5. Save Results
-    # ─────────────────────────────────────────────────────────────────
-    save_subdir = 'sesd_results'
-    _save_algo_image(
-        best_sample, 
-        os.path.join(out_path, f'recon_{save_subdir}', fname), 
-        is_mri_grayscale=(ref_img.shape[1]==1)
-    )
+    # ══════════════════════════════════════════════════════════════════
+    # Step 5: Save results
+    # ══════════════════════════════════════════════════════════════════
+    if best_sample is None:
+        best_sample = x_k
+        best_metrics = {
+            'psnr': psnrs[-1] if psnrs else 0,
+            'ssim': ssims[-1] if ssims else 0,
+            'lpips': lpipss[-1] if lpipss else 0
+        }
     
-    print(f"SESD Final {fname}: Best PSNR {best_psnr:.4f} at epoch {best_epoch}")
-    
-    return best_sample, best_metrics, {'psnrs': psnrs_log}
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Compatibility Wrappers
-# ═══════════════════════════════════════════════════════════════════════
-
-def SESD(
-    model, sampler, measurement_cond_fn, ref_img, y_n, device, 
-    model_config, measure_config, operator, fname,
-    iter_step=3, iteration=300, denoiser_step=10, lr=0.02, 
-    out_path='./outputs/', mask=None, random_seed=None, 
-    writer=None, img_index=None, loss_fn_alex=None,
-    # ALES parameters (defaults match paper Table VI)
-    use_ales=True,
-    ales_window_size=10,
-    ales_var_threshold=1e-3,
-    ales_alpha=1e-3,
-    ales_patience=20,
-    ales_min_epochs=30,
-    **kwargs
-):
-    """
-    Standard SESD wrapper for super-resolution, inpainting, and deblurring.
-    """
-    if loss_fn_alex is None: 
-        loss_fn_alex = lpips.LPIPS(net='alex').to(device)
-    
-    # Create standard operator
-    std_operator = StandardOperator(operator, device)
-    
-    return SESD_Core(
-        model, sampler, measurement_cond_fn, ref_img, y_n,
-        model_config, std_operator, fname,
-        iter_step, iteration, denoiser_step, lr, out_path,
-        loss_fn_alex, device, mask_sampling=mask, random_seed=random_seed,
-        writer=writer, img_index=img_index,
-        use_ales=use_ales, 
-        ales_window_size=ales_window_size,
-        ales_var_threshold=ales_var_threshold,
-        ales_alpha=ales_alpha,
-        ales_patience=ales_patience,
-        ales_min_epochs=ales_min_epochs
-    )
-
-
-def SESD_MRI(
-    model, sampler, measurement_cond_fn, ref_img, y_n, 
-    k_under, mask_dc, csm, img_min, img_max,
-    device, model_config, measure_config, operator, fname,
-    iter_step=3, iteration=300, denoiser_step=10, lr=0.02,
-    out_path='./outputs/', random_seed=None,
-    writer=None, img_index=None, loss_fn_alex=None,
-    # ALES parameters
-    use_ales=True,
-    ales_window_size=10,
-    ales_var_threshold=1e-3,
-    ales_alpha=1e-3,
-    ales_patience=20,
-    ales_min_epochs=30,
-    **kwargs
-):
-    """
-    MRI-specific SESD wrapper for multi-coil k-space reconstruction.
-    """
-    if loss_fn_alex is None: 
-        loss_fn_alex = lpips.LPIPS(net='alex').to(device)
-    
-    # Create MRI operator
-    mri_operator = MRIOperator(device, k_under, mask_dc, csm, img_min, img_max)
-    
-    return SESD_Core(
-        model, sampler, measurement_cond_fn, ref_img, y_n,
-        model_config, mri_operator, fname,
-        iter_step, iteration, denoiser_step, lr, out_path,
-        loss_fn_alex, device, mask_sampling=mask_dc, random_seed=random_seed,
-        writer=writer, img_index=img_index,
-        use_ales=use_ales,
-        ales_window_size=ales_window_size,
-        ales_var_threshold=ales_var_threshold,
-        ales_alpha=ales_alpha,
-        ales_patience=ales_patience,
-        ales_min_epochs=ales_min_epochs
-    )
-
-
-# Legacy aliases for backward compatibility
-acce_RED_diff = SESD
-acce_RED_diff_mri = SESD_MRI
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Helper Functions
-# ═══════════════════════════════════════════════════════════════════════
-
-def _save_algo_image(tensor_data, file_path, is_kernel=False, is_mri_grayscale=False):
-    """Save tensor image to file with proper format handling."""
-    import matplotlib.pyplot as plt
+    # Save images to filesystem
     try:
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        img = tensor_data.detach().cpu()
-        if img.dim() == 4: 
-            img = img[0]
+        os.makedirs(os.path.join(out_path, 'recon_sesd'), exist_ok=True)
+        os.makedirs(os.path.join(out_path, 'input_sesd'), exist_ok=True)
+        os.makedirs(os.path.join(out_path, 'label_sesd'), exist_ok=True)
         
-        if is_mri_grayscale: 
-             if img.dim() == 3 and img.shape[0] == 3: 
-                 img = img[0] 
-             if img.dim() == 3: 
-                 img = img.squeeze(0)
-             plt.imsave(file_path, img.numpy(), cmap='gray')
-        else:
-             if img.dim() == 3 and img.shape[0] == 1: 
-                 img = img.squeeze(0)
-                 plt.imsave(file_path, img.numpy(), cmap='gray')
-             else:
-                 img = img.permute(1, 2, 0).numpy()
-                 img = (img + 1) / 2
-                 img = np.clip(img, 0, 1)
-                 plt.imsave(file_path, img)
+        def save_tensor_image(tensor, path):
+            img = tensor.detach().cpu()
+            if img.dim() == 4:
+                img = img.squeeze(0)
+            img_np = img.numpy()
+            if img_np.shape[0] == 3:
+                img_np = np.transpose(img_np, (1, 2, 0))
+            img_np = (img_np + 1) / 2
+            img_np = np.clip(img_np, 0, 1)
+            plt.imsave(path, img_np)
+        
+        save_tensor_image(best_sample, os.path.join(out_path, 'recon_sesd', fname))
+        save_tensor_image(y_n, os.path.join(out_path, 'input_sesd', fname))
+        save_tensor_image(ref_img, os.path.join(out_path, 'label_sesd', fname))
+        
+        print(f"✅ Images saved to {out_path}/[recon|input|label]_sesd/")
     except Exception as e:
-        print(f"Error saving {file_path}: {e}")
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# MRI Utilities (Minimal Set Required for MRIOperator)
-# ═══════════════════════════════════════════════════════════════════════
-
-def kspace2rss(kspace_data_real): 
-    """
-    Convert multi-coil k-space data to RSS (Root Sum of Squares) image.
+        print(f"Error saving images: {e}")
     
-    Args:
-        kspace_data_real: k-space data with real representation (B, num_coils, H, W, 2)
+    # Log curves to TensorBoard
+    if writer is not None and img_index is not None:
+        for i, loss_val in enumerate(losses):
+            writer.add_scalar(f'sesd/Image_{img_index}/Curves/Loss', loss_val, i)
+        for i, psnr_val in enumerate(psnrs):
+            writer.add_scalar(f'sesd/Image_{img_index}/Curves/PSNR', psnr_val, i)
+        for i, ssim_val in enumerate(ssims):
+            writer.add_scalar(f'sesd/Image_{img_index}/Curves/SSIM', ssim_val, i)
+        for i, lpips_val in enumerate(lpipss):
+            writer.add_scalar(f'sesd/Image_{img_index}/Curves/LPIPS', lpips_val, i)
     
-    Returns:
-        RSS image (B, 1, H, W)
-    """
-    kspace_complex = torch.view_as_complex(kspace_data_real.contiguous())
-    image_space_coils = fastmri.ifft2c(kspace_complex) 
-    abs_coil_images = fastmri.complex_abs(image_space_coils)
-    rss_image = fastmri.rss(abs_coil_images, dim=1) 
-    return rss_image.unsqueeze(1) 
-
-
-def rss_to_kspace(rss_image_normalized, csm, img_min, img_max):
-    """
-    Convert RSS image back to multi-coil k-space data.
+    print(f"\n{'='*60}")
+    print(f"SESD finished for {fname}")
+    print(f"Best epoch: {best_epoch}")
+    print(f"Best PSNR: {best_metrics['psnr']:.4f}")
+    print(f"Best SSIM: {best_metrics['ssim']:.4f}")
+    print(f"Best LPIPS: {best_metrics['lpips']:.4f}")
+    print(f"{'='*60}\n")
     
-    Args:
-        rss_image_normalized: Normalized RSS image (B, 1, H, W) in [-1, 1]
-        csm: Coil sensitivity maps (B, num_coils, H, W, 2)
-        img_min: Original RSS min values for denormalization
-        img_max: Original RSS max values for denormalization
-    
-    Returns:
-        k-space data (B, num_coils, H, W, 2)
-    """
-    rss_image = ((rss_image_normalized.squeeze(1) + 1.0) / 2.0) * \
-                (img_max.view(-1,1,1) - img_min.view(-1,1,1)) + img_min.view(-1,1,1)
-    csm_complex = torch.view_as_complex(csm.contiguous())
-    coil_images = csm_complex * rss_image.unsqueeze(1)
-    kspace = fastmri.fft2c(coil_images)
-    return torch.view_as_real(kspace.contiguous())
+    psnr_curve = {'psnrs': psnrs}
+    return best_sample, best_metrics, psnr_curve
 
 
-class DC_layer_CSM(nn.Module):
-    """Data Consistency layer using Coil Sensitivity Maps."""
-    def __init__(self): 
-        super().__init__()
-        
-    def forward(self, x_rss, k_under, mask, csm, img_min, img_max):
-        """
-        Apply data consistency correction in k-space.
-        
-        Args:
-            x_rss: Input RSS image (B, 1, H, W), normalized to [-1, 1]
-            k_under: Undersampled k-space data (B, num_coils, H, W, 2)
-            mask: Sampling mask
-            csm: Coil sensitivity maps (B, num_coils, H, W, 2)
-            img_min: Original RSS min for denormalization
-            img_max: Original RSS max for denormalization
-        
-        Returns:
-            Corrected RSS image (B, 1, H, W), renormalized to [-1, 1]
-        """
-        k_est = rss_to_kspace(x_rss, csm, img_min, img_max)
-        mask_bool = mask.squeeze(-1)
-        k_dc = (1 - mask_bool.float()) * torch.view_as_complex(k_est.contiguous()) + \
-               mask_bool.float() * torch.view_as_complex(k_under.contiguous())
-        rss_new = kspace2rss(torch.view_as_real(k_dc))
-        denom = (img_max.view(-1,1,1,1) - img_min.view(-1,1,1,1) + 1e-7)
-        rss_norm = ((rss_new - img_min.view(-1,1,1,1)) / denom) * 2.0 - 1.0
-        return torch.clamp(rss_norm, -1.0, 1.0)
-
-
-class mri_forward(nn.Module):
-    """MRI forward operator: image → undersampled k-space → image."""
-    def __init__(self): 
-        super().__init__()
-        
-    def forward(self, x_rss, mask, csm, img_min, img_max):
-        """
-        Forward MRI operator with undersampling simulation.
-        
-        Args:
-            x_rss: Input RSS image (B, 1, H, W), normalized to [-1, 1]
-            mask: Sampling mask
-            csm: Coil sensitivity maps
-            img_min: Original RSS min
-            img_max: Original RSS max
-        
-        Returns:
-            Undersampled RSS image (B, 1, H, W), renormalized to [-1, 1]
-        """
-        k_full = rss_to_kspace(x_rss, csm, img_min, img_max)
-        mask_to_apply = mask
-        if mask_to_apply.dim() == 2: 
-            mask_to_apply = mask_to_apply.unsqueeze(0).unsqueeze(0).unsqueeze(-1)
-        if mask_to_apply.shape[-1] == 1: 
-            mask_to_apply = mask_to_apply.squeeze(-1)
-        k_under = torch.view_as_complex(k_full.contiguous()) * mask_to_apply.unsqueeze(1)
-        rss_under = kspace2rss(torch.view_as_real(k_under))
-        denom = (img_max.view(-1,1,1,1) - img_min.view(-1,1,1,1) + 1e-7)
-        rss_norm = ((rss_under - img_min.view(-1,1,1,1)) / denom) * 2.0 - 1.0
-        return torch.clamp(rss_norm, -1.0, 1.0)
+# Alias for backward compatibility
+acce_RED_diff = sesd
+SESD = sesd
