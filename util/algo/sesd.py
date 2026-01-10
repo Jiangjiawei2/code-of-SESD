@@ -10,24 +10,26 @@ import fastmri
 from util.algo.utils import compute_metrics as compute_metrics_util, log_metrics_to_tensorboard, ESWithWMV
 
 # ═══════════════════════════════════════════════════════════════════════
-# 测量算子抽象层 (Measurement Operator Abstraction)
+# Measurement Operator Abstraction Layer
 # ═══════════════════════════════════════════════════════════════════════
 
 class MeasurementOperator:
-    """SESD中测量算子的基类"""
+    """Base class for measurement operators in SESD."""
     def forward(self, x, mask=None):
         raise NotImplementedError
     
     def project(self, x, y, mask=None, alpha=None):
         """
-        将x投影到由y定义的测量流形上
-        返回数据一致性更新 v_k
+        Projects x onto the measurement manifold defined by y.
+        Returns the data consistency update v_k.
         """
         raise NotImplementedError
 
 
 class StandardOperator(MeasurementOperator):
-    """标准算子：用于去模糊、超分辨率、修复等任务"""
+    """
+    Standard operator for deblurring, super-resolution, inpainting tasks.
+    """
     def __init__(self, operator_module, device, mu=1.0):
         self.operator = operator_module
         self.device = device
@@ -37,12 +39,12 @@ class StandardOperator(MeasurementOperator):
         return self.operator.forward(x, mask=mask) if mask is not None else self.operator.forward(x)
 
     def project(self, x, y, mask=None, alpha=None):
-        """基于梯度下降的投影（适用于一般线性/非线性问题）"""
+        """Gradient descent based projection for general linear/nonlinear problems."""
         with torch.enable_grad():
             x_in = x.detach().clone().requires_grad_(True)
             Ax = self.forward(x_in, mask)
             
-            # 使用MSE类梯度保持稳定性
+            # Use MSE-like gradient for stability
             loss = torch.linalg.norm(y - Ax)
             grad = torch.autograd.grad(loss, x_in)[0]
             
@@ -51,7 +53,9 @@ class StandardOperator(MeasurementOperator):
 
 
 class MRIOperator(MeasurementOperator):
-    """MRI专用算子：处理多线圈k空间数据"""
+    """
+    MRI specific operator handling multi-coil k-space data.
+    """
     def __init__(self, device, k_under, mask_dc, csm, img_min, img_max):
         self.device = device
         self.k_under = k_under
@@ -60,7 +64,7 @@ class MRIOperator(MeasurementOperator):
         self.img_min = img_min
         self.img_max = img_max
         
-        # 内部模块
+        # Internal modules
         self.dc_layer = DC_layer_CSM().to(device)
         self.mri_fwd = mri_forward().to(device)
 
@@ -68,18 +72,18 @@ class MRIOperator(MeasurementOperator):
         return self.mri_fwd(x, self.mask_dc, self.csm, self.img_min, self.img_max)
 
     def project(self, x, y, mask=None, alpha=None):
-        """数据一致性层"""
-        # x是[B, C, H, W]，MRI代码使用x[:, 0:1, ...]
+        """Data consistency layer projection."""
+        # x is [B, C, H, W]. MRI code uses x[:, 0:1, ...]
         x_single = x[:, 0:1, :, :]
         v_k_single = self.dc_layer(x_single, self.k_under, self.mask_dc, self.csm, self.img_min, self.img_max)
         
-        # 如有必要，广播回C通道（例如用于模型输入）
+        # Broadcast back to C channels if necessary (e.g. for model input)
         v_k = v_k_single.repeat(1, x.shape[1], 1, 1).contiguous()
         return v_k
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 核心算法：SESD with ALES
+# Core Algorithm: SESD with ALES
 # ═══════════════════════════════════════════════════════════════════════
 
 def SESD_Core(
@@ -88,7 +92,7 @@ def SESD_Core(
     iter_step, iteration, denoiser_step, lr, out_path,
     loss_fn_alex, device, mask_sampling=None, random_seed=None,
     writer=None, img_index=None,
-    # ALES 参数
+    # ALES parameters
     use_ales=True,
     ales_window_size=10,
     ales_var_threshold=1e-3,
@@ -97,23 +101,24 @@ def SESD_Core(
     ales_min_epochs=30
 ):
     """
-    SESD: Score Evolved Shortcut Diffusion with ALES
+    SESD: Score Evolved Shortcut Diffusion with ALES (Adaptive Local Early Stopping).
     
-    ALES参数:
-        use_ales: 是否启用ALES早停
-        ales_window_size: 时间加权方差的窗口大小
-        ales_var_threshold: 方差阈值δ_v
-        ales_alpha: 损失阈值α
-        ales_patience: 耐心参数P
-        ales_min_epochs: 最小迭代次数E_min
+    ALES Parameters:
+        use_ales: Whether to enable ALES early stopping
+        ales_window_size: Window size W for time-weighted variance
+        ales_var_threshold: Variance threshold δ_v
+        ales_alpha: Loss threshold α
+        ales_patience: Patience parameter P
+        ales_min_epochs: Minimum iterations E_min before early stopping
     """
     if random_seed is not None:
         torch.manual_seed(random_seed)
-        if torch.cuda.is_available(): torch.cuda.manual_seed_all(random_seed)
+        if torch.cuda.is_available(): 
+            torch.cuda.manual_seed_all(random_seed)
         np.random.seed(random_seed)
 
     # ─────────────────────────────────────────────────────────────────
-    # 配置记录到TensorBoard
+    # Logging configuration to TensorBoard
     # ─────────────────────────────────────────────────────────────────
     algo_name = "SESD"
     if writer and img_index is not None:
@@ -136,14 +141,14 @@ def SESD_Core(
         writer.add_text(f'{algo_name}/Image_{img_index}/Config', config_text, 0)
 
     # ─────────────────────────────────────────────────────────────────
-    # 1. 初始化Z在t*（捷径）
+    # 1. Initialize Z at t* (Shortcut)
     # ─────────────────────────────────────────────────────────────────
-    Z_channels = 3  # 标准RGB
+    Z_channels = 3  # Standard RGB
     Z = torch.randn((1, Z_channels, model_config['image_size'], model_config['image_size']), device=device)
     
     current_state = Z
     with torch.no_grad():
-        # 捷径：从T采样到t*（iter_step）
+        # Shortcut: sampling from T down to t* (iter_step)
         for i in range(denoiser_step - 1, iter_step - 1, -1):
             t_val = torch.tensor([i] * Z.shape[0], device=device)
             current_state, _ = sampler.p_sample(
@@ -154,22 +159,22 @@ def SESD_Core(
     initial_shortcut_state = current_state.detach().clone()
     
     # ─────────────────────────────────────────────────────────────────
-    # 2. 优化设置
+    # 2. Optimization Setup
     # ─────────────────────────────────────────────────────────────────
     x_opt = initial_shortcut_state.requires_grad_(True)
     
-    # 可学习的平衡参数λ（在rebuttal中renamed from alpha）
+    # Learnable balancing parameter λ (renamed from α in rebuttal for clarity)
     lambda_param = torch.tensor(0.5, requires_grad=True, device=device) 
     
     optimizer = torch.optim.Adam([
         {'params': x_opt, 'lr': lr},
-        {'params': lambda_param, 'lr': lr * 0.1}  # λ使用更小的学习率
+        {'params': lambda_param, 'lr': lr * 0.1}  # Smaller LR for λ
     ])
     
     data_fidelity_loss_fn = nn.L1Loss().to(device)
     
     # ─────────────────────────────────────────────────────────────────
-    # 3. ALES早停器初始化
+    # 3. ALES Early Stopper Initialization
     # ─────────────────────────────────────────────────────────────────
     if use_ales:
         early_stopper = ESWithWMV(
@@ -189,14 +194,14 @@ def SESD_Core(
     psnrs_log = []
     
     # ─────────────────────────────────────────────────────────────────
-    # 4. 优化循环（带ALES）
+    # 4. Optimization Loop (with ALES)
     # ─────────────────────────────────────────────────────────────────
     pbar = tqdm(range(iteration), desc=f"SESD Opt. Img {img_index or ''}")
     for epoch in pbar:
         model.eval()
         optimizer.zero_grad()
         
-        # ═══ A. 从当前x_{t*}去噪到x_0（近似） ═══
+        # ═══ A. Denoise from current x_{t*} to x_0 (approx) ═══
         denoised_state = x_opt
         for i in range(iter_step - 1, -1, -1):
              t_val = torch.tensor([i] * denoised_state.shape[0], device=device)
@@ -205,22 +210,22 @@ def SESD_Core(
                  measurement=y_n, measurement_cond_fn=measurement_cond_fn, mask=mask_sampling
              )
         
-        # ═══ B. 数据一致性加速 ═══
+        # ═══ B. Data Consistency via Operator Projection ═══
         v_k = operator.project(denoised_state, y_n, mask=mask_sampling)
         
-        # ═══ C. 融合（使用λ而非α） ═══
+        # ═══ C. Fusion (using λ instead of α) ═══
         current_lambda = torch.sigmoid(lambda_param)
         x_k_fusion = current_lambda * denoised_state + (1 - current_lambda) * v_k
         
-        # ═══ D. 损失计算 ═══
+        # ═══ D. Loss Calculation ═══
         est_measurement = operator.forward(x_k_fusion, mask=mask_sampling)
         loss = data_fidelity_loss_fn(est_measurement, y_n)
         
-        # ═══ E. 反向传播 ═══
+        # ═══ E. Backpropagation ═══
         loss.backward()
         optimizer.step()
         
-        # ═══ F. 指标记录 & ALES检查 ═══
+        # ═══ F. Metrics Logging & ALES Check ═══
         with torch.no_grad():
             sample_eval = x_k_fusion
             if ref_img.shape[1] == 1 and x_k_fusion.shape[1] == 3:
@@ -238,14 +243,14 @@ def SESD_Core(
                 'psnr': curr_psnr
             })
             
-            # 更新最佳样本
+            # Update best sample
             if not np.isnan(curr_psnr) and curr_psnr > best_psnr:
                 best_psnr = curr_psnr
                 best_sample = x_k_fusion.detach().clone()
                 best_metrics = curr_metrics.copy()
                 best_epoch = epoch
                 
-            # TensorBoard记录
+            # TensorBoard logging
             if writer and img_index is not None:
                 log_metrics_to_tensorboard(writer, {
                     'Loss': loss.item(), 
@@ -254,12 +259,11 @@ def SESD_Core(
                     'Lambda': current_lambda.item()
                 }, epoch, img_index, prefix=f'{algo_name}/Epoch')
             
-            # ═══ ALES早停检查 ═══
+            # ═══ ALES Early Stopping Check ═══
             if use_ales:
-                # ALES需要图像和损失来判断
                 should_stop = early_stopper(epoch, x_k_fusion, loss.item())
                 if should_stop:
-                    print(f"\n🛑 ALES触发早停于epoch {epoch+1}")
+                    print(f"\n🛑 ALES triggered early stopping at epoch {epoch+1}")
                     if writer and img_index is not None:
                         writer.add_text(
                             f'{algo_name}/Image_{img_index}/ALES_Stop',
@@ -271,7 +275,7 @@ def SESD_Core(
         best_sample = x_k_fusion.detach()
     
     # ─────────────────────────────────────────────────────────────────
-    # 5. 保存结果
+    # 5. Save Results
     # ─────────────────────────────────────────────────────────────────
     save_subdir = 'sesd_results'
     _save_algo_image(
@@ -286,7 +290,7 @@ def SESD_Core(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 兼容性包装器
+# Compatibility Wrappers
 # ═══════════════════════════════════════════════════════════════════════
 
 def SESD(
@@ -295,7 +299,7 @@ def SESD(
     iter_step=3, iteration=300, denoiser_step=10, lr=0.02, 
     out_path='./outputs/', mask=None, random_seed=None, 
     writer=None, img_index=None, loss_fn_alex=None,
-    # ALES参数（符合论文中的默认值）
+    # ALES parameters (defaults match paper Table VI)
     use_ales=True,
     ales_window_size=10,
     ales_var_threshold=1e-3,
@@ -305,12 +309,12 @@ def SESD(
     **kwargs
 ):
     """
-    标准SESD包装器（超分、修复、去模糊）
+    Standard SESD wrapper for super-resolution, inpainting, and deblurring.
     """
     if loss_fn_alex is None: 
         loss_fn_alex = lpips.LPIPS(net='alex').to(device)
     
-    # 创建标准算子
+    # Create standard operator
     std_operator = StandardOperator(operator, device)
     
     return SESD_Core(
@@ -335,7 +339,7 @@ def SESD_MRI(
     iter_step=3, iteration=300, denoiser_step=10, lr=0.02,
     out_path='./outputs/', random_seed=None,
     writer=None, img_index=None, loss_fn_alex=None,
-    # ALES参数
+    # ALES parameters
     use_ales=True,
     ales_window_size=10,
     ales_var_threshold=1e-3,
@@ -345,12 +349,12 @@ def SESD_MRI(
     **kwargs
 ):
     """
-    MRI专用SESD包装器
+    MRI-specific SESD wrapper for multi-coil k-space reconstruction.
     """
     if loss_fn_alex is None: 
         loss_fn_alex = lpips.LPIPS(net='alex').to(device)
     
-    # 创建MRI算子
+    # Create MRI operator
     mri_operator = MRIOperator(device, k_under, mask_dc, csm, img_min, img_max)
     
     return SESD_Core(
@@ -368,26 +372,29 @@ def SESD_MRI(
     )
 
 
-# 向后兼容的别名
+# Legacy aliases for backward compatibility
 acce_RED_diff = SESD
 acce_RED_diff_mri = SESD_MRI
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 辅助函数
+# Helper Functions
 # ═══════════════════════════════════════════════════════════════════════
 
 def _save_algo_image(tensor_data, file_path, is_kernel=False, is_mri_grayscale=False):
-    """保存张量图像到文件"""
+    """Save tensor image to file with proper format handling."""
     import matplotlib.pyplot as plt
     try:
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         img = tensor_data.detach().cpu()
-        if img.dim() == 4: img = img[0]
+        if img.dim() == 4: 
+            img = img[0]
         
         if is_mri_grayscale: 
-             if img.dim() == 3 and img.shape[0] == 3: img = img[0] 
-             if img.dim() == 3: img = img.squeeze(0)
+             if img.dim() == 3 and img.shape[0] == 3: 
+                 img = img[0] 
+             if img.dim() == 3: 
+                 img = img.squeeze(0)
              plt.imsave(file_path, img.numpy(), cmap='gray')
         else:
              if img.dim() == 3 and img.shape[0] == 1: 
@@ -403,11 +410,19 @@ def _save_algo_image(tensor_data, file_path, is_kernel=False, is_mri_grayscale=F
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# MRI工具函数（最小集合）
+# MRI Utilities (Minimal Set Required for MRIOperator)
 # ═══════════════════════════════════════════════════════════════════════
 
 def kspace2rss(kspace_data_real): 
-    """从多线圈k空间数据计算RSS图像"""
+    """
+    Convert multi-coil k-space data to RSS (Root Sum of Squares) image.
+    
+    Args:
+        kspace_data_real: k-space data with real representation (B, num_coils, H, W, 2)
+    
+    Returns:
+        RSS image (B, 1, H, W)
+    """
     kspace_complex = torch.view_as_complex(kspace_data_real.contiguous())
     image_space_coils = fastmri.ifft2c(kspace_complex) 
     abs_coil_images = fastmri.complex_abs(image_space_coils)
@@ -416,7 +431,18 @@ def kspace2rss(kspace_data_real):
 
 
 def rss_to_kspace(rss_image_normalized, csm, img_min, img_max):
-    """将RSS图像转换回k空间数据"""
+    """
+    Convert RSS image back to multi-coil k-space data.
+    
+    Args:
+        rss_image_normalized: Normalized RSS image (B, 1, H, W) in [-1, 1]
+        csm: Coil sensitivity maps (B, num_coils, H, W, 2)
+        img_min: Original RSS min values for denormalization
+        img_max: Original RSS max values for denormalization
+    
+    Returns:
+        k-space data (B, num_coils, H, W, 2)
+    """
     rss_image = ((rss_image_normalized.squeeze(1) + 1.0) / 2.0) * \
                 (img_max.view(-1,1,1) - img_min.view(-1,1,1)) + img_min.view(-1,1,1)
     csm_complex = torch.view_as_complex(csm.contiguous())
@@ -426,11 +452,25 @@ def rss_to_kspace(rss_image_normalized, csm, img_min, img_max):
 
 
 class DC_layer_CSM(nn.Module):
-    """数据一致性层（使用线圈灵敏度图）"""
+    """Data Consistency layer using Coil Sensitivity Maps."""
     def __init__(self): 
         super().__init__()
         
     def forward(self, x_rss, k_under, mask, csm, img_min, img_max):
+        """
+        Apply data consistency correction in k-space.
+        
+        Args:
+            x_rss: Input RSS image (B, 1, H, W), normalized to [-1, 1]
+            k_under: Undersampled k-space data (B, num_coils, H, W, 2)
+            mask: Sampling mask
+            csm: Coil sensitivity maps (B, num_coils, H, W, 2)
+            img_min: Original RSS min for denormalization
+            img_max: Original RSS max for denormalization
+        
+        Returns:
+            Corrected RSS image (B, 1, H, W), renormalized to [-1, 1]
+        """
         k_est = rss_to_kspace(x_rss, csm, img_min, img_max)
         mask_bool = mask.squeeze(-1)
         k_dc = (1 - mask_bool.float()) * torch.view_as_complex(k_est.contiguous()) + \
@@ -442,11 +482,24 @@ class DC_layer_CSM(nn.Module):
 
 
 class mri_forward(nn.Module):
-    """MRI前向算子"""
+    """MRI forward operator: image → undersampled k-space → image."""
     def __init__(self): 
         super().__init__()
         
     def forward(self, x_rss, mask, csm, img_min, img_max):
+        """
+        Forward MRI operator with undersampling simulation.
+        
+        Args:
+            x_rss: Input RSS image (B, 1, H, W), normalized to [-1, 1]
+            mask: Sampling mask
+            csm: Coil sensitivity maps
+            img_min: Original RSS min
+            img_max: Original RSS max
+        
+        Returns:
+            Undersampled RSS image (B, 1, H, W), renormalized to [-1, 1]
+        """
         k_full = rss_to_kspace(x_rss, csm, img_min, img_max)
         mask_to_apply = mask
         if mask_to_apply.dim() == 2: 
